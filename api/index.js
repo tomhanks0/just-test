@@ -2,7 +2,9 @@ export const config = {
   runtime: "edge",
 };
 
-const HOP_BY_HOP_HEADERS = new Set([
+const TARGET_BASE = (process.env.MY_D || "").replace(/\/$/, "");
+
+const STRIP_HEADERS = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -18,68 +20,53 @@ const HOP_BY_HOP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
-const BASE_URL = (process.env.MY_D || "").replace(/\/$/, "");
-
-export default async function handler(request) {
-  if (!BASE_URL) {
+export default async function handler(req) {
+  if (!TARGET_BASE) {
     return new Response("Misconfigured: MY_D is not set", { status: 500 });
   }
 
   try {
-    const incomingUrl = new URL(request.url);
-    const destination = `${BASE_URL}${incomingUrl.pathname}${incomingUrl.search}`;
+    const url = new URL(req.url);
+    const targetUrl = TARGET_BASE + url.pathname + url.search;
 
-    const outgoingHeaders = new Headers();
-    let ip = null;
-
-    for (const [header, value] of request.headers.entries()) {
-      const name = header.toLowerCase();
-
-      if (HOP_BY_HOP_HEADERS.has(name)) continue;
-      if (name.startsWith("x-vercel-")) continue;
-
-      if (name === "x-real-ip") {
-        ip = value;
-        continue;
-      }
-
-      if (name === "x-forwarded-for" && !ip) {
-        ip = value;
-        continue;
-      }
-
-      outgoingHeaders.set(name, value);
+    const headers = new Headers();
+    let clientIp = null;
+    for (const [key, value] of req.headers) {
+      const k = key.toLowerCase();
+      if (STRIP_HEADERS.has(k)) continue;
+      if (k.startsWith("x-vercel-")) continue;
+      if (k === "x-real-ip") { clientIp = value; continue; }
+      if (k === "x-forwarded-for") { if (!clientIp) clientIp = value; continue; }
+      headers.set(k, value);
     }
+    if (clientIp) headers.set("x-forwarded-for", clientIp);
 
-    if (ip) {
-      outgoingHeaders.set("x-forwarded-for", ip);
-    }
+    const method = req.method;
+    const hasBody = method !== "GET" && method !== "HEAD";
 
-    const method = request.method;
-    const options = {
+    const fetchOpts = {
       method,
-      headers: outgoingHeaders,
+      headers,
       redirect: "manual",
     };
-
-    if (!["GET", "HEAD"].includes(method)) {
-      options.body = request.body;
-      options.duplex = "half";
+    if (hasBody) {
+      fetchOpts.body = req.body;
+      fetchOpts.duplex = "half";
     }
 
-    const response = await fetch(destination, options);
+    const upstream = await fetch(targetUrl, fetchOpts);
 
-    const cleanHeaders = new Headers();
-    for (const [key, value] of response.headers.entries()) {
-      if (key.toLowerCase() === "transfer-encoding") continue;
-      cleanHeaders.set(key, value);
+    const respHeaders = new Headers();
+    for (const [k, v] of upstream.headers) {
+      if (k.toLowerCase() === "transfer-encoding") continue;
+      respHeaders.set(k, v);
     }
 
-    return new Response(response.body, {
-      status: response.status,
-      headers: cleanHeaders,
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: respHeaders,
     });
-  } catch (e) {
+  } catch (err) {
     return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
   }
 }
